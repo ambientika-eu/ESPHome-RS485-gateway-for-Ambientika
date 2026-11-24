@@ -1,5 +1,7 @@
 # ESPHome RS485 gateway for Ambientika ADVANCED+ / ADVANCED B+
 
+![ADVANCED+ in Home Assistant with an M5Stack Atom Lite and RS485](docs/social-preview.png)
+
 Local Home Assistant control for **Ambientika ADVANCED+** and **ADVANCED B+** decentralised ventilation units with heat recovery, via their RS485 interface. Runs on an **M5Stack Atom Lite** with the **M5Stack Atomic RS485 Base**. No cloud, no extra gateway, about 20 to 25 euros of hardware.
 
 Provided by SÜDWIND GmbH, Eppan (Italy), manufacturer of [Ambientika](https://www.ambientika.eu). Community solution, see [Disclaimer](#disclaimer).
