@@ -1,0 +1,660 @@
+# ---------------------------------------------------------------------------
+# Ambientika ADVANCED B+ / ADVANCED+  -  RS485-Gateway fuer Home Assistant
+# Hardware: M5Stack Atom Lite (ESP32) + M5Stack Atomic RS485 Base (A131)
+#
+# SUEDWIND - AIR SYSTEMS, Eppan (BZ), Italien
+# Fassung Atom 1.1 vom 23.11.2026, auf Basis von ambientika-gateway-rev3.yaml
+# (16.11.2026). Referenz: "Programmierung Ambientika ueber RS485",
+# Revision November 2026, Abschnitte 3, 4, 5 und 7, sowie AN-2026-01 (Boost).
+#
+# Aenderungen gegenueber rev3:
+#   1. Hardware Atom Lite: board m5stack-atom, UART TX GPIO19 / RX GPIO22.
+#      Achtung: Die Tabelle im Datenblatt der Atomic RS485 Base nennt
+#      "TX G22 / RX G19" aus Sicht der Base; die M5Stack-Beispiele
+#      verwenden fuer den ESP32 RX = GPIO22, TX = GPIO19. Die Base hat
+#      keinen DE-Pin (automatische Richtungsumschaltung), daher kein
+#      flow_control_pin, und keinen eingebauten 120-Ohm-Abschluss.
+#   2. Grundeinstellung fuer ADVANCED B+ im Bad: Betriebsart
+#      Waermerueckgewinnung, Feuchtestufe 2 (Automatik, Feuchtesensor des
+#      Geraets aktiv), Geschwindigkeit Tag. Auf dem Bus: 0x6A / 0x66 im
+#      Wechsel mit 15 s Motor Pause (0x20).
+#   3. Boost wie AN-2026-01: 20 Minuten Abluft Stufe 3 (0x27), danach
+#      zurueck in die eingestellte Betriebsart. Start/Ende ueber Tasten in
+#      Home Assistant oder die Taste am Atom (Druck = Boost an/aus).
+#      Die Schutzlogik in send_mode erzwingt vor und nach dem Boost die
+#      Motor Pause; die 20 Minuten zaehlen ab dem ersten Boost-Telegramm.
+#   4. Status-LED am Atom: gruen = Statusantwort des Geraets kommt,
+#      blau = Boost laeuft, rot = keine Statusantwort (Verkabelung A/B,
+#      DIP-Schalter oder Strom pruefen). Erste Statusabfrage 10 s nach Start.
+#   5. Ausschalten (0x00, Klappe zu) und Filter-Reset (0x00/0x01) erst nach
+#      mind. 15 s Motor Pause, wie in AN-2026-03 ("zuerst Motor Pause,
+#      danach Motor aus mit geschlossener Klappe"). In rev3 ging 0x00
+#      direkt aus dem Lauf.
+#   6. Sendeluecken-Schutz mit zwei Schwellen: 1,2 s im Normalfall, 4,5 s
+#      nur direkt nach einer Statusabfrage (vorher pauschal 4,5 s).
+#   7. Betriebsart "Motor Pause" oder "Aus, Klappe zu" beendet einen
+#      laufenden Boost.
+#   8. Absicherung eingebaut: Schluessel fuer API und OTA, Anmeldung fuer
+#      die Weboberflaeche und AP-Passwort aus secrets.yaml; kein Neustart
+#      bei WLAN-Ausfall.
+# Unveraendert aus rev3: Schutzlogik (mind. 15 s Motor Pause vor jedem
+# Wechsel), 500-ms-Takt, Statusabfrage alle 60 s mit 3 s Funkstille,
+# Sendeluecken-Schutz, Filter-Reset, Empfangsparser, nur dokumentierte
+# Befehle auf dem Bus.
+#
+# Anschluss: Base A -> Klemme 4, Base B -> Klemme 3, Base GND -> Klemme 5.
+# 120 Ohm zwischen Klemme 3 und 4. Atom ueber USB-C mit 5 V versorgen, den
+# 12-V-Eingang der Base frei lassen. DIP am Geraet: Master mit Wandpanel
+# (DIP1 ON, DIP2 ON), nach dem Umstellen Geraet kurz stromlos schalten.
+# Am RS485-Strang darf neben dem Gateway kein Wandpanel angeschlossen sein.
+#
+# secrets.yaml (neben dieser Datei, eigene Werte eintragen):
+#   wifi_ssid, wifi_password, ap_password, api_key (32 Byte base64, z. B.
+#   mit "openssl rand -base64 32"; gilt auch fuer OTA), web_password
+# ---------------------------------------------------------------------------
+
+substitutions:
+  pause_ms: "15000"     # Motor Pause vor jedem Wechsel, mind. 15000 (wird geprueft)
+  wrg_ms: "60000"       # Laufzeit je Richtung im Betrieb Waermerueckgewinnung
+  gap_ms: "4500"        # groesste zulaessige Luecke direkt nach einer Statusabfrage
+  gap_short_ms: "1200"  # groesste zulaessige Luecke im Normalbetrieb
+  boost_ms: "1200000"   # Boost-Dauer 20 Minuten
+
+esphome:
+  name: ambientika-gateway
+  friendly_name: Ambientika Gateway
+  on_boot:
+    then:
+      # Nach jedem Start zuerst 3 s schweigen: eine Statusabfrage kurz vor
+      # dem Neustart koennte sonst noch in ihrer Funkstille liegen.
+      - lambda: |-
+          id(amb_quiet) = true;
+          id(amb_quiet_start) = millis();
+
+esp32:
+  board: m5stack-atom
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  reboot_timeout: 0s    # kein Neustart bei WLAN-Ausfall (Boost liefe sonst ab)
+  ap:
+    ssid: "Ambientika-Setup"
+    password: !secret ap_password
+
+web_server:
+  port: 80
+  version: 3
+  local: true           # Oberflaeche funktioniert auch ohne Internet
+  ota: false            # kein Firmware-Upload ueber die Weboberflaeche
+  auth:
+    type: digest
+    username: admin
+    password: !secret web_password
+
+captive_portal:
+
+logger:
+  baud_rate: 0          # keine Ausgabe auf UART0, Logging nur ueber die API
+
+api:
+  reboot_timeout: 0s    # kein Neustart, wenn Home Assistant nicht verbunden ist
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    encryption: {}        # nutzt den API-Schluessel
+
+# ---------------------------------------------------------------------------
+# 1. Zustand
+# ---------------------------------------------------------------------------
+globals:
+  # Bedienung (bleibt ueber Neustart erhalten)
+  - id: amb_mode              # Betriebsart, Index siehe Auswahlfeld
+    type: uint8_t
+    restore_value: yes
+    initial_value: "0"        # Waermerueckgewinnung
+
+  - id: amb_speed             # 0 = Nacht, 1..3 = Stufe 1..3   (Bit 0-1)
+    type: uint8_t
+    restore_value: yes
+    initial_value: "2"        # Tag
+
+  - id: amb_hum               # Feuchtestufe 1..3 als 0..2      (Bit 6-7)
+    type: uint8_t
+    restore_value: yes
+    initial_value: "1"        # Feuchtestufe 2 = Automatik
+
+  # Boost (nicht ueber Neustart erhalten)
+  - id: amb_boost             # Boost angefordert
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: amb_boost_started     # erstes Boost-Telegramm ist gesendet
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: amb_boost_ms          # Zeitpunkt des ersten Boost-Telegramms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  # Ablauf
+  - id: amb_wrg_dir           # Richtung der laufenden WRG-Phase: 1 Abluft, 2 Zuluft
+    type: uint8_t
+    restore_value: no
+    initial_value: "2"
+
+  - id: amb_last_sig          # zuletzt gesendete Fahrkonfiguration (Bits 2-7 ohne Klappe)
+    type: uint8_t             # 0 = Motor steht, 0xFF = unbekannt (nach dem Start)
+    restore_value: no
+    initial_value: "0xFF"
+
+  - id: amb_stop_ms           # Zeitpunkt des ersten Stopp-Telegramms nach einem Lauf
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: amb_run_ms            # Zeitpunkt des ersten Telegramms der laufenden Konfiguration
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: amb_reset_left        # noch zu sendende Filter-Reset-Telegramme
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: amb_tx_ms             # Zeitpunkt des letzten gesendeten Moduskommandos
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: amb_tick              # Taktzaehler fuer die Statusabfrage
+    type: uint8_t
+    restore_value: no
+    initial_value: "100"      # erste Statusabfrage 10 s nach dem Start
+
+  - id: amb_q_since_tx        # seit dem letzten Moduskommando kam eine Statusabfrage
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: amb_last_d1           # zuletzt gesendetes Datenbyte 1 (Diagnose)
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: amb_quiet             # Funkstille nach Statusabfrage aktiv
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: amb_quiet_start       # Zeitpunkt der Statusabfrage (millis)
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: amb_status_seen       # mindestens eine gueltige Statusmeldung empfangen
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: amb_status_ms         # Zeitpunkt der letzten gueltigen Statusmeldung
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: amb_led_state         # zuletzt gesetzte LED-Farbe (0 aus, 1 gruen, 2 blau, 3 rot)
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+
+# ---------------------------------------------------------------------------
+# 2. Statusmeldung (Typ 0x00), Boost-Anzeige, Taste am Atom
+# ---------------------------------------------------------------------------
+binary_sensor:
+  - platform: template
+    name: "Ambientika Daemmerung"
+    id: amb_daemmerung
+
+  - platform: template
+    name: "Ambientika Filteralarm"
+    id: amb_filteralarm
+    device_class: problem
+
+  - platform: template
+    name: "Ambientika Feuchtealarm"
+    id: amb_feuchtealarm
+    device_class: moisture
+
+  # Aus = seit 150 s keine gueltige Statusmeldung. Haeufigste Ursache laut
+  # Hersteller: Master steht auf "Master mit Fernbedienung" (DIP2 OFF).
+  - platform: template
+    name: "Ambientika Statusantwort"
+    id: amb_status_ok
+    device_class: connectivity
+    entity_category: diagnostic
+    lambda: |-
+      return id(amb_status_seen) && (millis() - id(amb_status_ms)) < 150000UL;
+
+  - platform: template
+    name: "Ambientika Boost aktiv"
+    id: amb_boost_active
+    lambda: |-
+      return id(amb_boost);
+
+  # Taste am Atom Lite (GPIO39): Druck schaltet den Boost an bzw. aus
+  - platform: gpio
+    id: atom_key
+    pin:
+      number: GPIO39
+      inverted: true
+    use_interrupt: false        # ESP32-Erratum: Stoerimpulse an GPIO36/39
+    filters:
+      - delayed_on: 50ms
+      - delayed_off: 50ms
+    on_press:
+      - script.execute: boost_toggle
+
+text_sensor:
+  - platform: template
+    name: "Ambientika Datenbyte"
+    entity_category: diagnostic
+    update_interval: 2s
+    lambda: |-
+      char b[8];
+      snprintf(b, sizeof(b), "0x%02X", id(amb_last_d1));
+      return std::string(b);
+
+# ---------------------------------------------------------------------------
+# 3. UART (Atomic RS485 Base, automatische
+#    Richtungsumschaltung, daher kein flow_control_pin)
+#    Achtung: ESP32 TX = GPIO19, RX = GPIO22 (Datenblatt-Tabelle der Base
+#    nennt die Pins aus Sicht der Base umgekehrt).
+#    after.delimiter sorgt dafuer, dass die Sequenz pro Rahmen aufgerufen wird.
+# ---------------------------------------------------------------------------
+uart:
+  - id: uart_bus
+    tx_pin: GPIO19
+    rx_pin: GPIO22
+    baud_rate: 9600
+    data_bits: 8
+    stop_bits: 1
+    parity: NONE
+
+    debug:
+      direction: RX
+      dummy_receiver: true
+      after:
+        delimiter: "\x03"
+        bytes: 64
+        timeout: 100ms
+
+      sequence:
+        - lambda: |-
+            static bool in_frame = false;
+            static std::vector<uint8_t> buf;
+
+            auto hexval = [](uint8_t ch) -> uint8_t {
+              if (ch >= '0' && ch <= '9') return ch - '0';
+              if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+              if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+              return 0xFF;
+            };
+
+            for (uint8_t c : bytes) {
+              // Ein STX mitten im Rahmen startet einen neuen Rahmen.
+              if (c == 0x02) { in_frame = true; buf.clear(); continue; }
+              if (!in_frame) continue;
+
+              if (c != 0x03) {
+                if (buf.size() < 64) buf.push_back(c);
+                continue;
+              }
+
+              in_frame = false;
+
+              if (buf.size() < 4 || buf.size() % 2 != 0) continue;
+
+              std::vector<uint8_t> f;
+              bool bad = false;
+              for (size_t i = 0; i < buf.size(); i += 2) {
+                uint8_t hi = hexval(buf[i]);
+                uint8_t lo = hexval(buf[i + 1]);
+                if (hi == 0xFF || lo == 0xFF) { bad = true; break; }
+                f.push_back((hi << 4) | lo);
+              }
+              if (bad) continue;
+
+              uint8_t crc = 0;
+              for (size_t i = 0; i + 1 < f.size(); i++) crc ^= f[i];
+              if (crc != f.back()) continue;
+
+              // Nur Typ 0x00 auswerten. Der Master schickt zu jedem
+              // Moduskommando zusaetzlich einen Echo-Rahmen vom Typ 0x01.
+              if (f[0] != 0x00) continue;
+
+              // Statusmeldung: Typ + 3 Datenbytes + Pruefsumme = 5 Bytes
+              if (f.size() != 5) continue;
+
+              uint8_t st = f[1];
+
+              // Bit 3 ist bei der gueltigen Statusmeldung dauerhaft gesetzt.
+              if (!(st & 0x08)) continue;
+
+              id(amb_status_seen) = true;
+              id(amb_status_ms) = millis();
+              id(amb_daemmerung).publish_state(st & 0x01);
+              id(amb_filteralarm).publish_state(st & 0x02);
+              id(amb_feuchtealarm).publish_state(st & 0x04);
+            }
+
+# ---------------------------------------------------------------------------
+# 4. Senden
+# ---------------------------------------------------------------------------
+script:
+  # Moduskommando, Typ 0x01, zwei Datenbytes. Einziger Sendeweg ueberhaupt,
+  # wird nur vom 500-ms-Takt aufgerufen. Hier sitzen Statusabfrage,
+  # Funkstille, die Schutzlogik fuer Richtungs-/Moduswechsel, Boost und WRG-Takt.
+  - id: send_mode
+    mode: single
+    then:
+      - lambda: |-
+          static_assert(${pause_ms}UL >= 15000UL, "Motor Pause muss mindestens 15 s betragen");
+          const uint32_t now = millis();
+
+          // Boost-Ende pruefen (auch waehrend der Funkstille), 20 min ab dem
+          // ersten gesendeten Boost-Telegramm
+          if (id(amb_boost) && id(amb_boost_started) &&
+              (uint32_t)(now - id(amb_boost_ms)) >= ${boost_ms}UL) {
+            id(amb_boost) = false;
+            id(amb_boost_started) = false;
+          }
+          if (!id(amb_boost)) id(amb_boost_started) = false;
+
+          // Funkstille nach der Statusabfrage und nach dem Start (ueberlauffest).
+          // 3000 ms ab Schreibbeginn. Bewusst nicht 3100: dann fiele das naechste
+          // Moduskommando erst auf den Takt bei 3,5 s und die Luecke zwischen
+          // zwei Moduskommandos wuechse von 3,5 auf 4,0 s.
+          if (id(amb_quiet)) {
+            if ((uint32_t)(now - id(amb_quiet_start)) < 3000UL) return;
+            id(amb_quiet) = false;
+          }
+
+          // Statusabfrage, Typ 0x02, bei jedem 120. Takt statt des
+          // Moduskommandos. Nur Typbyte und Pruefsumme: \x02 '0' '2' '0' '2' \x03
+          if (++id(amb_tick) >= 120) {
+            id(amb_tick) = 0;
+            const uint8_t q[6] = {0x02, '0', '2', '0', '2', 0x03};
+            id(uart_bus).write_array(q, 6);
+            id(amb_quiet) = true;          // danach 3 s lang nichts senden
+            id(amb_quiet_start) = now;
+            id(amb_q_since_tx) = true;
+            return;
+          }
+
+          // Sendeluecke: Hat das Geraet laenger kein Moduskommando bekommen,
+          // kann es in den Standalone-Betrieb gefallen sein. Zustand dann
+          // als unbekannt behandeln, es folgt zuerst Motor Pause.
+          // Normal 1,2 s; direkt nach einer Statusabfrage (3 s Funkstille)
+          // gilt gap_ms.
+          {
+            const uint32_t lim = id(amb_q_since_tx) ? ${gap_ms}UL : ${gap_short_ms}UL;
+            if ((uint32_t)(now - id(amb_tx_ms)) > lim) id(amb_last_sig) = 0xFF;
+          }
+
+          // 1. Zielzustand aus der Betriebsart
+          //    dir: 0 = steht, 1 = Abluft, 2 = Zuluft
+          //    follow: Bit 4, alle Geraete in dieselbe Richtung (0x3x)
+          uint8_t mode = id(amb_mode);
+          if (mode > 6) mode = 0;     // wie im Auswahlfeld angezeigt
+          uint8_t dir = 0, follow = 0, flap = 1;
+          switch (mode) {
+            case 0: dir = (id(amb_wrg_dir) == 1) ? 1 : 2; break;  // Waermerueckgewinnung
+            case 1: dir = 1; break;                               // Abluft
+            case 2: dir = 2; break;                               // Zuluft
+            case 3: dir = 1; follow = 1; break;                   // alle Abluft
+            case 4: dir = 2; follow = 1; break;                   // alle Zuluft
+            case 5: dir = 0; flap = 1; break;                     // Motor Pause
+            default: dir = 0; flap = 0; break;                    // aus, Klappe zu
+          }
+          // Bit 4 ist nur mit Feuchtestufe 1 dokumentiert
+          uint8_t hum = id(amb_hum);
+          if (hum > 2) hum = 0;       // wie im Auswahlfeld angezeigt
+          if (follow) hum = 0;
+          uint8_t spd = id(amb_speed) & 0x03;
+          uint8_t d2 = 0x00;
+
+          // Boost (AN-2026-01): Abluft Stufe 3, Feuchtestufe 1 -> 0x27.
+          // Gilt in jeder Betriebsart, auch aus Pause/Aus heraus.
+          const bool boost = id(amb_boost);
+          if (boost) { dir = 1; follow = 0; hum = 0; spd = 3; flap = 1; }
+
+          // Filter-Reset nur als dokumentierter Befehl 0x00 / 0x01
+          if (id(amb_reset_left) > 0) { dir = 0; flap = 0; d2 = 0x01; }
+
+          // Drehzahl. Feuchtestufe 2/3: dokumentiert sind nur Nacht (0) und Tag (2)
+          if (hum != 0) spd = (spd == 0) ? 0 : 2;
+
+          // 2. Fahrkonfiguration. Jede Aenderung davon ist ein Richtungs- oder
+          //    Moduswechsel. Die Drehzahl zaehlt nur in Feuchtestufe 2/3 mit
+          //    (Nacht/Tag), im manuellen Modus darf sie im Lauf wechseln.
+          uint8_t sig = (dir == 0) ? 0 : (uint8_t) ((dir << 2) | (follow << 4) | (hum << 6) |
+                                                    (hum != 0 ? spd : 0));
+
+          // 3. Schutz: eine neue Fahrkonfiguration erst nach mindestens
+          //    pause_ms Stillstand, gemessen ab dem ersten gesendeten
+          //    Stopp-Telegramm. Sonst stattdessen Motor Pause (0x20).
+          if (sig != 0 && sig != id(amb_last_sig)) {
+            bool ok = (id(amb_last_sig) == 0) &&
+                      ((uint32_t)(now - id(amb_stop_ms)) >= ${pause_ms}UL);
+            if (!ok) { dir = 0; flap = 1; d2 = 0x00; sig = 0; }
+          }
+          // Ausschalten (0x00) und Filter-Reset erst nach mindestens
+          // pause_ms Motor Pause; bis dahin 0x20 (Klappe offen).
+          if (sig == 0 && flap == 0) {
+            bool ok = (id(amb_last_sig) == 0) &&
+                      ((uint32_t)(now - id(amb_stop_ms)) >= ${pause_ms}UL);
+            if (!ok) { flap = 1; d2 = 0x00; }
+          }
+
+          // 4. Datenbyte 1. Stillstand immer genau 0x20 oder 0x00.
+          uint8_t d1;
+          if (dir == 0) {
+            d1 = flap ? 0x20 : 0x00;
+          } else {
+            d1 = spd | (dir << 2) | (follow << 4) | 0x20 | (hum << 6);
+          }
+
+          const uint8_t t = 0x01;
+          const uint8_t crc = t ^ d1 ^ d2;
+          const char *hex = "0123456789ABCDEF";
+          auto put = [&](uint8_t b) {
+            id(uart_bus).write_byte(hex[b >> 4]);
+            id(uart_bus).write_byte(hex[b & 0x0F]);
+          };
+          id(uart_bus).write_byte(0x02);
+          put(t); put(d1); put(d2); put(crc);
+          id(uart_bus).write_byte(0x03);
+
+          // 5. Buchfuehrung ueber das tatsaechlich Gesendete
+          if (sig == 0) {
+            if (id(amb_last_sig) != 0) id(amb_stop_ms) = now;   // Pause beginnt
+          } else if (sig != id(amb_last_sig)) {
+            id(amb_run_ms) = now;                               // Lauf beginnt
+          }
+          id(amb_last_sig) = sig;
+          id(amb_last_d1) = d1;
+          id(amb_tx_ms) = now;
+          id(amb_q_since_tx) = false;
+          if (d2 & 0x01) id(amb_reset_left)--;
+
+          // Boost-Zeit startet mit dem ersten tatsaechlich gesendeten
+          // Boost-Telegramm (Abluft Stufe 3)
+          if (boost && !id(amb_boost_started) && d1 == 0x27) {
+            id(amb_boost_started) = true;
+            id(amb_boost_ms) = now;
+          }
+
+          // 6. WRG-Takt: nach wrg_ms Laufzeit Richtung wechseln. Die Motor
+          //    Pause dazwischen erzwingt Schritt 3 beim naechsten Takt.
+          if (mode == 0 && !boost && sig != 0 &&
+              (uint32_t)(now - id(amb_run_ms)) >= ${wrg_ms}UL) {
+            id(amb_wrg_dir) = (dir == 2) ? 1 : 2;
+          }
+
+  # Boost anfordern bzw. neu starten (20 min ab dem ersten Boost-Telegramm)
+  - id: boost_start
+    mode: single
+    then:
+      - lambda: |-
+          id(amb_boost) = true;
+          id(amb_boost_started) = false;
+
+  - id: boost_stop
+    mode: single
+    then:
+      - lambda: |-
+          id(amb_boost) = false;
+          id(amb_boost_started) = false;
+
+  - id: boost_toggle
+    mode: single
+    then:
+      - lambda: |-
+          id(amb_boost) = !id(amb_boost);
+          id(amb_boost_started) = false;
+
+# ---------------------------------------------------------------------------
+# 5. Sendetakt
+#    Das Moduskommando muss zyklisch alle 500 ms auf dem Bus liegen, sonst
+#    faellt das Geraet in den Standalone-Betrieb zurueck und haelt den Modus
+#    nicht. Statusabfrage und Sperrzeit danach erledigt send_mode selbst.
+# ---------------------------------------------------------------------------
+interval:
+  - interval: 500ms
+    then:
+      - script.execute: send_mode
+
+  # Status-LED: gruen = Statusantwort kommt, blau = Boost, rot = keine Antwort
+  - interval: 1s
+    then:
+      - lambda: |-
+          uint8_t want;
+          if (id(amb_boost)) want = 2;
+          else if (id(amb_status_seen) && (millis() - id(amb_status_ms)) < 150000UL) want = 1;
+          else want = 3;
+          if (want == id(amb_led_state)) return;
+          id(amb_led_state) = want;
+          auto call = id(atom_led).turn_on();
+          call.set_brightness(0.3f);
+          if (want == 1) call.set_rgb(0.0f, 1.0f, 0.0f);
+          else if (want == 2) call.set_rgb(0.0f, 0.0f, 1.0f);
+          else call.set_rgb(1.0f, 0.0f, 0.0f);
+          call.perform();
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: atom_led
+    name: "Ambientika Gateway LED"
+    internal: true
+    pin: GPIO27
+    num_leds: 1
+    chipset: SK6812
+    channel_colors: GRB
+    default_transition_length: 0s
+
+# ---------------------------------------------------------------------------
+# 6. Bedienung
+#    Auswahlfelder und Tasten schreiben nur den Zielzustand. Was wann auf den
+#    Bus geht, entscheidet allein send_mode.
+# ---------------------------------------------------------------------------
+button:
+  - platform: template
+    name: "Ambientika Filter zuruecksetzen"
+    on_press:
+      - lambda: 'id(amb_reset_left) = 8;'
+
+  - platform: template
+    name: "Ambientika Boost 20 min"
+    on_press:
+      - script.execute: boost_start
+
+  - platform: template
+    name: "Ambientika Boost beenden"
+    on_press:
+      - script.execute: boost_stop
+
+select:
+  - platform: template
+    name: "Ambientika Betriebsart"
+    update_interval: 2s
+    options:
+      - "Wärmerückgewinnung"
+      - "Abluft"
+      - "Zuluft"
+      - "Alle Abluft (ohne WRG)"
+      - "Alle Zuluft (ohne WRG)"
+      - "Motor Pause"
+      - "Aus, Klappe zu"
+    lambda: |-
+      static const char *const o[] = {"Wärmerückgewinnung", "Abluft", "Zuluft",
+        "Alle Abluft (ohne WRG)", "Alle Zuluft (ohne WRG)", "Motor Pause", "Aus, Klappe zu"};
+      uint8_t m = id(amb_mode);
+      if (m > 6) m = 0;
+      return std::string(o[m]);
+    set_action:
+      - lambda: |-
+          static const char *const o[] = {"Wärmerückgewinnung", "Abluft", "Zuluft",
+            "Alle Abluft (ohne WRG)", "Alle Zuluft (ohne WRG)", "Motor Pause", "Aus, Klappe zu"};
+          for (uint8_t k = 0; k < 7; k++) {
+            if (x == o[k]) {
+              id(amb_mode) = k;
+              // Motor Pause / Aus beenden einen laufenden Boost
+              if (k >= 5) { id(amb_boost) = false; id(amb_boost_started) = false; }
+              break;
+            }
+          }
+
+  - platform: template
+    name: "Ambientika Geschwindigkeit"
+    update_interval: 2s
+    options:
+      - "Nacht"
+      - "Stufe 1"
+      - "Stufe 2"
+      - "Stufe 3"
+    lambda: |-
+      static const char *const o[] = {"Nacht", "Stufe 1", "Stufe 2", "Stufe 3"};
+      return std::string(o[id(amb_speed) & 0x03]);
+    set_action:
+      - lambda: |-
+          static const char *const o[] = {"Nacht", "Stufe 1", "Stufe 2", "Stufe 3"};
+          for (uint8_t k = 0; k < 4; k++) {
+            if (x == o[k]) { id(amb_speed) = k; break; }
+          }
+
+  # Feuchtestufe 2 und 3 sind Automatikmodus; dort sind nur Nacht und Tag
+  # dokumentiert (Stufe 1 bis 3 werden als Tag gesendet).
+  - platform: template
+    name: "Ambientika Feuchtestufe"
+    update_interval: 2s
+    options:
+      - "Feuchtestufe 1"
+      - "Feuchtestufe 2"
+      - "Feuchtestufe 3"
+    lambda: |-
+      static const char *const o[] = {"Feuchtestufe 1", "Feuchtestufe 2", "Feuchtestufe 3"};
+      uint8_t h = id(amb_hum);
+      if (h > 2) h = 0;
+      return std::string(o[h]);
+    set_action:
+      - lambda: |-
+          static const char *const o[] = {"Feuchtestufe 1", "Feuchtestufe 2", "Feuchtestufe 3"};
+          for (uint8_t k = 0; k < 3; k++) {
+            if (x == o[k]) { id(amb_hum) = k; break; }
+          }

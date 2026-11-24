@@ -1,0 +1,6 @@
+secrets.yaml
+.esphome/
+tests/sim_gen.h
+tests/harness
+tests/hm
+tests/mut.yaml
